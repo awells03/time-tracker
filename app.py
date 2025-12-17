@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import sqlite3
 from datetime import datetime, date, timedelta
+from streamlit_autorefresh import st_autorefresh
 
 # ----------------------------
 # Settings
@@ -12,8 +13,6 @@ PEOPLE = ["Drew", "Carson", "Kaden", "Chandler"]  # edit names
 WEEKLY_TARGET = 10.0
 MONTHLY_TARGET = 40.0
 WEEK_START = 0  # 0=Mon, 6=Sun
-
-ADMIN_NAME = "Drew"  # who you are (for admin-style views)
 
 # ----------------------------
 # DB helpers
@@ -58,7 +57,7 @@ def init_db():
         )
     """)
 
-    # notifications for manual adjustments
+    # notifications for manual entries/adjustments
     cur.execute("""
         CREATE TABLE IF NOT EXISTS notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,7 +65,8 @@ def init_db():
             person TEXT NOT NULL,
             log_date TEXT NOT NULL,
             delta_hours REAL NOT NULL,
-            reason TEXT NOT NULL
+            reason TEXT NOT NULL,
+            kind TEXT NOT NULL
         )
     """)
 
@@ -96,19 +96,18 @@ def add_log(log_date: date, person: str, hours: float, notes: str, source: str):
     c.commit()
     c.close()
 
-def add_notification(person: str, log_date: date, delta_hours: float, reason: str):
+def add_notification(person: str, log_date: date, delta_hours: float, reason: str, kind: str):
     c = conn()
     cur = c.cursor()
     cur.execute("""
-        INSERT INTO notifications (created_at, person, log_date, delta_hours, reason)
-        VALUES (?, ?, ?, ?, ?)
-    """, (now_utc_str(), person, log_date.isoformat(), float(delta_hours), reason))
+        INSERT INTO notifications (created_at, person, log_date, delta_hours, reason, kind)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (now_utc_str(), person, log_date.isoformat(), float(delta_hours), reason, kind))
     c.commit()
     c.close()
 
 def fetch_logs():
     c = conn()
-    # explicitly select columns that exist (after migration they should)
     df = pd.read_sql_query(
         "SELECT log_date, person, hours, notes, source, created_at FROM logs",
         c
@@ -122,7 +121,7 @@ def fetch_logs():
 def fetch_notifications():
     c = conn()
     df = pd.read_sql_query(
-        "SELECT created_at, person, log_date, delta_hours, reason FROM notifications ORDER BY created_at DESC",
+        "SELECT created_at, person, log_date, delta_hours, reason, kind FROM notifications ORDER BY created_at DESC",
         c
     )
     c.close()
@@ -162,6 +161,11 @@ def week_start(d: date) -> date:
 def month_start(d: date) -> date:
     return d.replace(day=1)
 
+def month_end(d: date) -> date:
+    if d.month == 12:
+        return date(d.year, 12, 31)
+    return date(d.year, d.month + 1, 1) - timedelta(days=1)
+
 def fmt_hms(seconds: int) -> str:
     seconds = max(0, int(seconds))
     h = seconds // 3600
@@ -184,7 +188,7 @@ st.markdown("""
   padding: 16px;
   background: rgba(255,255,255,0.03);
 }
-.big { font-size: 40px; font-weight: 800; letter-spacing: 1px; }
+.big { font-size: 44px; font-weight: 850; letter-spacing: 1px; }
 .muted { opacity: 0.75; font-size: 13px; }
 </style>
 """, unsafe_allow_html=True)
@@ -214,11 +218,23 @@ with tabs[0]:
         update_timer(person, 0, None, 0, today.isoformat())
         is_running, started_at, acc_sec, active_date = fetch_timer(person)
 
+    # Auto-refresh once per second ONLY when running (so the timer visibly ticks)
+    if int(is_running) == 1:
+        st_autorefresh(interval=1000, key=f"tick_{person}")
+
+    # Compute display seconds
     current_seconds = int(acc_sec)
     if int(is_running) == 1 and started_at:
         current_seconds += int((datetime.utcnow() - parse_dt(started_at)).total_seconds())
 
+    # Obvious status
+    if int(is_running) == 1:
+        st.success("🟢 CLOCKED IN (timer running)")
+    else:
+        st.info("⚪ CLOCKED OUT")
+
     c1, c2, c3 = st.columns([2,1,1])
+
     with c1:
         st.markdown("<div class='cool-card'>", unsafe_allow_html=True)
         st.markdown(f"<div class='muted'>Date: <b>{today}</b></div>", unsafe_allow_html=True)
@@ -228,7 +244,7 @@ with tabs[0]:
 
     with c2:
         st.markdown("<div class='cool-card'>", unsafe_allow_html=True)
-        st.write("Timer")
+        st.write("Timer controls")
         if int(is_running) == 0:
             if st.button("▶️ Start", use_container_width=True):
                 update_timer(person, 1, now_utc_str(), int(acc_sec), today.isoformat())
@@ -245,14 +261,19 @@ with tabs[0]:
 
     with c3:
         st.markdown("<div class='cool-card'>", unsafe_allow_html=True)
-        st.write("Quick add (manual)")
-        quick = st.number_input("Hours", 0.0, 24.0, 0.0, 0.25)
+        st.write("Manual add — reason required")
+        quick = st.number_input("Hours", 0.0, 24.0, 0.0, 0.25, key="quick_hours")
+        quick_reason = st.text_input("Reason (required)", value="", key="quick_reason")
+
         if st.button("➕ Add", use_container_width=True):
             if quick <= 0:
                 st.warning("Enter > 0 hours.")
+            elif quick_reason.strip() == "":
+                st.warning("Please enter a reason (required).")
             else:
-                add_log(today, person, quick, notes="Manual add", source="manual")
-                st.success(f"Added {quick:.2f} hours.")
+                add_log(today, person, quick, notes=quick_reason.strip(), source="manual")
+                add_notification(person, today, quick, quick_reason.strip(), kind="manual_add")
+                st.success(f"Added {quick:.2f} hours and recorded the reason.")
                 st.rerun()
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -269,8 +290,11 @@ with tabs[1]:
         df["week_start"] = df["log_date"].apply(week_start)
         df["month_start"] = df["log_date"].apply(month_start)
 
-        wk = df[df["week_start"] == week_start(today)].groupby("person")["hours"].sum().reindex(PEOPLE).fillna(0.0)
-        mo = df[df["month_start"] == month_start(today)].groupby("person")["hours"].sum().reindex(PEOPLE).fillna(0.0)
+        this_week = week_start(today)
+        this_month = month_start(today)
+
+        wk = df[df["week_start"] == this_week].groupby("person")["hours"].sum().reindex(PEOPLE).fillna(0.0)
+        mo = df[df["month_start"] == this_month].groupby("person")["hours"].sum().reindex(PEOPLE).fillna(0.0)
 
         board = pd.DataFrame({
             "person": PEOPLE,
@@ -296,14 +320,14 @@ with tabs[1]:
         )
 
 # ----------------------------
-# Adjustments (require comment + notify)
+# Adjustments (require reason + notify)
 # ----------------------------
 with tabs[2]:
     st.subheader("Adjust time (requires a reason)")
 
     adj_date = st.date_input("Date to adjust", value=today, key="adj_date")
-    minutes = st.number_input("Minutes (+ add / - subtract)", min_value=-600, max_value=600, value=0, step=5)
-    reason = st.text_input("Reason (required)", value="")
+    minutes = st.number_input("Minutes (+ add / - subtract)", min_value=-600, max_value=600, value=0, step=5, key="adj_minutes")
+    reason = st.text_input("Reason (required)", value="", key="adj_reason")
 
     if st.button("Apply adjustment", use_container_width=True):
         if minutes == 0:
@@ -313,25 +337,23 @@ with tabs[2]:
         else:
             delta_hours = minutes / 60.0
             add_log(adj_date, person, delta_hours, notes=reason.strip(), source="adjustment")
-            add_notification(person, adj_date, delta_hours, reason.strip())
-            st.success(f"Applied {delta_hours:+.2f} hrs on {adj_date} and notified admin.")
+            add_notification(person, adj_date, delta_hours, reason.strip(), kind="adjustment")
+            st.success(f"Applied {delta_hours:+.2f} hrs on {adj_date} and recorded the reason.")
             st.rerun()
 
 # ----------------------------
 # Notifications (your inbox)
 # ----------------------------
 with tabs[3]:
-    st.subheader("Notifications (Adjustment inbox)")
+    st.subheader("Notifications (Manual entries & adjustments)")
 
     ndf = fetch_notifications()
     if ndf.empty:
-        st.info("No adjustment notifications yet.")
+        st.info("No notifications yet.")
     else:
         st.dataframe(ndf, use_container_width=True)
         csv = ndf.to_csv(index=False).encode("utf-8")
-        st.download_button("Download notifications CSV", csv, file_name="adjustment_notifications.csv", mime="text/csv")
-
-        st.caption("Next upgrade: auto-email these to Drew (requires adding an email secret).")
+        st.download_button("Download notifications CSV", csv, file_name="time_tracker_notifications.csv", mime="text/csv")
 
 # ----------------------------
 # Logs
