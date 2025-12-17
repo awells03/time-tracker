@@ -1,9 +1,6 @@
 streamlit
-pandas
 streamlit-autorefresh
 
-streamlit
-streamlit-autorefresh
 
 
 
