@@ -2,6 +2,13 @@ import streamlit as st
 import sqlite3
 from datetime import datetime, date, timedelta
 
+# Auto-refresh (safe + compatible)
+try:
+    from streamlit_autorefresh import st_autorefresh
+    HAVE_AUTOREFRESH = True
+except Exception:
+    HAVE_AUTOREFRESH = False
+
 # ----------------------------
 # SETTINGS
 # ----------------------------
@@ -14,31 +21,55 @@ WEEKLY_TARGET = 10.0
 MONTHLY_TARGET = 40.0
 WEEK_START = 0  # Monday
 
-REFRESH_SECONDS = 2  # keep smooth without annoying flicker
+REFRESH_MS = 1500  # refresh while clocked in (lower flicker than 1000ms)
 
 # ----------------------------
-# DB
+# DB helpers (robust)
 # ----------------------------
 def db():
-    return sqlite3.connect(DB_PATH, check_same_thread=False)
+    # timeout helps with "database is locked"
+    con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
+    cur = con.cursor()
+    # WAL helps reliability on Streamlit Cloud
+    cur.execute("PRAGMA journal_mode=WAL;")
+    cur.execute("PRAGMA synchronous=NORMAL;")
+    return con
+
+def table_exists(cur, name: str) -> bool:
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
+    return cur.fetchone() is not None
+
+def columns(cur, table: str) -> set:
+    cur.execute(f"PRAGMA table_info({table})")
+    return {r[1] for r in cur.fetchall()}
+
+def ensure_column(cur, table: str, col: str, ddl_type: str):
+    cols = columns(cur, table)
+    if col not in cols:
+        cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl_type}")
 
 def init_db():
     con = db()
     cur = con.cursor()
 
-    # Tables (create if missing)
+    # --- logs (migratable)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
+            created_at TEXT,
             log_date TEXT NOT NULL,
             person TEXT NOT NULL,
             hours REAL NOT NULL,
-            notes TEXT NOT NULL,
-            source TEXT NOT NULL
+            notes TEXT,
+            source TEXT
         )
     """)
+    # Add missing cols if old DB exists
+    ensure_column(cur, "logs", "created_at", "TEXT")
+    ensure_column(cur, "logs", "notes", "TEXT")
+    ensure_column(cur, "logs", "source", "TEXT")
 
+    # --- timers
     cur.execute("""
         CREATE TABLE IF NOT EXISTS timers (
             person TEXT PRIMARY KEY,
@@ -49,10 +80,11 @@ def init_db():
         )
     """)
 
+    # --- notifications (migratable)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL,
+            created_at TEXT,
             person TEXT NOT NULL,
             log_date TEXT NOT NULL,
             delta_hours REAL NOT NULL,
@@ -60,14 +92,15 @@ def init_db():
             kind TEXT NOT NULL
         )
     """)
+    ensure_column(cur, "notifications", "created_at", "TEXT")
 
-    # Ensure timer row exists for each person
-    today = date.today().isoformat()
+    # Ensure timer rows
+    today_iso = date.today().isoformat()
     for p in PEOPLE:
         cur.execute("""
             INSERT OR IGNORE INTO timers (person, is_running, started_at, accumulated_seconds, active_date)
             VALUES (?, 0, NULL, 0, ?)
-        """, (p, today))
+        """, (p, today_iso))
 
     con.commit()
     con.close()
@@ -78,19 +111,35 @@ def now_utc():
 def now_utc_str():
     return now_utc().isoformat()
 
+# ----------------------------
+# Time helpers
+# ----------------------------
 def week_start(d: date) -> date:
     return d - timedelta(days=(d.weekday() - WEEK_START) % 7)
 
 def month_start(d: date) -> date:
     return d.replace(day=1)
 
+def fmt_hms(seconds: int) -> str:
+    seconds = max(0, int(seconds))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+# ----------------------------
+# Queries (no pandas)
+# ----------------------------
 def fetch_timer(person: str):
     con = db()
     cur = con.cursor()
     cur.execute("SELECT is_running, started_at, accumulated_seconds, active_date FROM timers WHERE person=?", (person,))
     row = cur.fetchone()
     con.close()
-    return row  # (is_running, started_at, accumulated_seconds, active_date)
+    # row always exists due to init_db, but guard anyway
+    if not row:
+        return (0, None, 0, date.today().isoformat())
+    return row
 
 def update_timer(person: str, is_running: int, started_at, accumulated_seconds: int, active_date: str):
     con = db()
@@ -99,7 +148,7 @@ def update_timer(person: str, is_running: int, started_at, accumulated_seconds: 
         UPDATE timers
         SET is_running=?, started_at=?, accumulated_seconds=?, active_date=?
         WHERE person=?
-    """, (is_running, started_at, accumulated_seconds, active_date, person))
+    """, (int(is_running), started_at, int(accumulated_seconds), active_date, person))
     con.commit()
     con.close()
 
@@ -123,48 +172,44 @@ def add_notification(person: str, log_date: date, delta_hours: float, reason: st
     con.commit()
     con.close()
 
-def fetch_week_totals(target_week_start: date):
-    """Return dict: person -> hours in that week."""
-    start = target_week_start
+def week_totals(d: date):
+    start = week_start(d)
     end = start + timedelta(days=7)
     con = db()
     cur = con.cursor()
     cur.execute("""
-        SELECT person, COALESCE(SUM(hours),0)
+        SELECT person, COALESCE(SUM(hours), 0)
         FROM logs
         WHERE log_date >= ? AND log_date < ?
         GROUP BY person
     """, (start.isoformat(), end.isoformat()))
     rows = cur.fetchall()
     con.close()
-    totals = {p: 0.0 for p in PEOPLE}
-    for person, total in rows:
-        totals[person] = float(total or 0.0)
-    return totals
+    out = {p: 0.0 for p in PEOPLE}
+    for p, v in rows:
+        out[p] = float(v or 0.0)
+    return out
 
-def fetch_month_totals(target_month_start: date):
-    """Return dict: person -> hours in that month."""
-    start = target_month_start
-    # next month start
+def month_totals(d: date):
+    start = month_start(d)
     if start.month == 12:
         end = date(start.year + 1, 1, 1)
     else:
         end = date(start.year, start.month + 1, 1)
-
     con = db()
     cur = con.cursor()
     cur.execute("""
-        SELECT person, COALESCE(SUM(hours),0)
+        SELECT person, COALESCE(SUM(hours), 0)
         FROM logs
         WHERE log_date >= ? AND log_date < ?
         GROUP BY person
     """, (start.isoformat(), end.isoformat()))
     rows = cur.fetchall()
     con.close()
-    totals = {p: 0.0 for p in PEOPLE}
-    for person, total in rows:
-        totals[person] = float(total or 0.0)
-    return totals
+    out = {p: 0.0 for p in PEOPLE}
+    for p, v in rows:
+        out[p] = float(v or 0.0)
+    return out
 
 def fetch_notifications(limit=200):
     con = db()
@@ -174,12 +219,12 @@ def fetch_notifications(limit=200):
         FROM notifications
         ORDER BY created_at DESC
         LIMIT ?
-    """, (limit,))
+    """, (int(limit),))
     rows = cur.fetchall()
     con.close()
     return rows
 
-def fetch_logs(limit=500):
+def fetch_logs(limit=300):
     con = db()
     cur = con.cursor()
     cur.execute("""
@@ -187,17 +232,10 @@ def fetch_logs(limit=500):
         FROM logs
         ORDER BY log_date DESC, created_at DESC
         LIMIT ?
-    """, (limit,))
+    """, (int(limit),))
     rows = cur.fetchall()
     con.close()
     return rows
-
-def fmt_hms(seconds: int) -> str:
-    seconds = max(0, int(seconds))
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
 
 # ----------------------------
 # UI
@@ -205,85 +243,54 @@ def fmt_hms(seconds: int) -> str:
 st.set_page_config(page_title="Equity Vesting Time Tracker", layout="wide")
 init_db()
 
-# simple styling
-st.markdown("""
-<style>
-.block-container { padding-top: 1.1rem; }
-.title-row { display:flex; align-items:center; gap:12px; }
-.pill {
-  display:inline-block; padding:6px 12px; border-radius:999px;
-  border:1px solid rgba(255,255,255,0.12);
-  background: rgba(255,255,255,0.04);
-  font-size:12px; opacity:0.85;
-}
-.timer {
-  font-size: 54px;
-  font-weight: 900;
-  letter-spacing: 2px;
-  margin-top: 6px;
-}
-.card {
-  border:1px solid rgba(255,255,255,0.12);
-  border-radius:16px;
-  padding:16px;
-  background: rgba(255,255,255,0.03);
-}
-.small { font-size:13px; opacity:0.8; }
-</style>
-""", unsafe_allow_html=True)
-
-st.markdown("<div class='title-row'><h1>⏱️ Equity Vesting Time Tracker</h1></div>", unsafe_allow_html=True)
+st.title("⏱️ Equity Vesting Time Tracker")
 st.caption("Clock in / Clock out • Weekly goal 10 hrs • Monthly vesting 40 hrs")
 
 with st.sidebar:
     st.subheader("Controls")
     person = st.selectbox("Who are you?", PEOPLE)
     today = st.date_input("Today", value=date.today())
-    st.markdown("---")
+    st.divider()
     st.write("Everyone can see everyone (leaderboard enabled).")
 
-tabs = ["⏱️ Clock In", "🏆 Leaderboard", "✍️ Manual Time", "🔔 Notifications"]
+tab_names = ["⏱️ Clock In", "🏆 Leaderboard", "✍️ Manual Time", "🔔 Notifications"]
 if person == ADMIN:
-    tabs.append("🧾 Logs (Admin)")
-
-tabs = st.tabs(tabs)
+    tab_names.append("🧾 Logs (Admin)")
+tabs = st.tabs(tab_names)
 
 # ----------------------------
 # TAB 1: CLOCK IN
 # ----------------------------
 with tabs[0]:
+    st.subheader("Clock In / Clock Out")
+
     is_running, started_at, acc_sec, active_date = fetch_timer(person)
 
-    # auto-roll day (simple)
+    # If day changed and not running, reset accumulator
     if active_date != today.isoformat() and int(is_running) == 0:
         update_timer(person, 0, None, 0, today.isoformat())
         is_running, started_at, acc_sec, active_date = fetch_timer(person)
 
-    # compute seconds
+    # Auto-refresh ONLY while running
+    if int(is_running) == 1 and HAVE_AUTOREFRESH:
+        st_autorefresh(interval=REFRESH_MS, key=f"tick_{person}")
+
+    # Compute display seconds
     seconds = int(acc_sec)
     if int(is_running) == 1 and started_at:
         seconds += int((now_utc() - datetime.fromisoformat(started_at)).total_seconds())
 
-    # Auto-refresh while clocked in (every REFRESH_SECONDS)
     if int(is_running) == 1:
-        st.meta_refresh(REFRESH_SECONDS)
+        st.success("🟢 CLOCKED IN — Timer running")
+        st.caption("Time is actively counting…")
+    else:
+        st.info("⚪ CLOCKED OUT")
 
-    c1, c2, c3 = st.columns([2,1,1])
+    st.markdown(f"## {fmt_hms(seconds)}")
+
+    c1, c2, c3 = st.columns([1,1,1])
 
     with c1:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        if int(is_running) == 1:
-            st.success("🟢 CLOCKED IN — Timer is running")
-        else:
-            st.info("⚪ CLOCKED OUT")
-        st.markdown(f"<div class='small'>Date: <b>{today}</b></div>", unsafe_allow_html=True)
-        st.markdown(f"<div class='timer'>{fmt_hms(seconds)}</div>", unsafe_allow_html=True)
-        st.markdown("<div class='small'>Tip: If you forget, use Manual Time (reason required).</div>", unsafe_allow_html=True)
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with c2:
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("**Clock controls**")
         if int(is_running) == 0:
             if st.button("▶️ Clock In", use_container_width=True):
                 update_timer(person, 1, now_utc_str(), int(acc_sec), today.isoformat())
@@ -293,72 +300,61 @@ with tabs[0]:
                 hours = seconds / 3600.0
                 add_log(today, person, hours, "Clocked session", "timer")
                 update_timer(person, 0, None, 0, today.isoformat())
-                st.success(f"Saved {hours:.2f} hrs for {today}")
+                st.success(f"Saved {hours:.2f} hrs")
                 st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
+
+    with c2:
+        wk = week_totals(today).get(person, 0.0)
+        st.metric("This week", f"{wk:.2f} hrs")
+        st.progress(min(1.0, wk / WEEKLY_TARGET) if WEEKLY_TARGET else 0.0)
 
     with c3:
-        # Show quick status vs weekly target for THIS person
-        this_week = week_start(today)
-        wk_totals = fetch_week_totals(this_week)
-        my_week = wk_totals.get(person, 0.0)
+        mo = month_totals(today).get(person, 0.0)
+        st.metric("This month", f"{mo:.2f} hrs")
+        st.progress(min(1.0, mo / MONTHLY_TARGET) if MONTHLY_TARGET else 0.0)
 
-        st.markdown("<div class='card'>", unsafe_allow_html=True)
-        st.markdown("**This week**")
-        st.write(f"**{my_week:.2f} hrs** / {WEEKLY_TARGET:.0f} hrs")
-        st.progress(min(1.0, my_week / WEEKLY_TARGET) if WEEKLY_TARGET else 0.0)
-        st.markdown("</div>", unsafe_allow_html=True)
+    if not HAVE_AUTOREFRESH and int(is_running) == 1:
+        st.warning("Auto-refresh package not installed. Add it to requirements.txt (see below) to make the timer tick visually.")
 
 # ----------------------------
 # TAB 2: LEADERBOARD
 # ----------------------------
 with tabs[1]:
-    this_week = week_start(today)
-    this_month = month_start(today)
+    st.subheader("Leaderboard")
 
-    wk = fetch_week_totals(this_week)
-    mo = fetch_month_totals(this_month)
+    wk = week_totals(today)
+    mo = month_totals(today)
 
-    # Sort by week hours desc
     ordered = sorted(PEOPLE, key=lambda p: (wk.get(p, 0.0), mo.get(p, 0.0)), reverse=True)
 
-    st.subheader("🏆 Weekly Leaderboard")
-    st.caption(f"Week starting {this_week.isoformat()} • Goal: {WEEKLY_TARGET:.0f} hrs/person")
-
+    st.caption(f"Week starting {week_start(today)} • Goal {WEEKLY_TARGET:.0f} hrs")
     for i, p in enumerate(ordered, start=1):
         hrs = wk.get(p, 0.0)
-        st.markdown(f"**#{i} {p}** — {hrs:.2f} hrs")
+        st.write(f"**#{i} {p}** — {hrs:.2f} hrs")
         st.progress(min(1.0, hrs / WEEKLY_TARGET) if WEEKLY_TARGET else 0.0)
 
     st.divider()
-    st.subheader("📅 Monthly Vesting Progress")
-    st.caption(f"Month starting {this_month.isoformat()} • Vesting: {MONTHLY_TARGET:.0f} hrs/person")
-
+    st.caption(f"Month starting {month_start(today)} • Vesting {MONTHLY_TARGET:.0f} hrs")
     for p in PEOPLE:
         hrs = mo.get(p, 0.0)
         status = "✅ VESTED" if hrs >= MONTHLY_TARGET else "⏳ In progress"
-        st.markdown(f"**{p}** — {hrs:.2f} hrs • {status}")
+        st.write(f"**{p}** — {hrs:.2f} hrs • {status}")
         st.progress(min(1.0, hrs / MONTHLY_TARGET) if MONTHLY_TARGET else 0.0)
 
 # ----------------------------
-# TAB 3: MANUAL TIME (REASON REQUIRED ALWAYS)
+# TAB 3: MANUAL TIME (reason required)
 # ----------------------------
 with tabs[2]:
-    st.subheader("✍️ Manual Time (Reason Required)")
+    st.subheader("Manual Time (Reason Required)")
 
-    st.markdown("Use this if you forgot to clock in, or need to correct time. **A reason is required and gets recorded.**")
+    entry_date = st.date_input("Date", value=today, key="m_date")
+    mode = st.radio("Type", ["Add hours", "Adjust (+/- minutes)"], horizontal=True)
 
-    col1, col2 = st.columns([1,2])
-    with col1:
-        mode = st.radio("Type", ["Add time", "Adjust (+/- minutes)"], horizontal=False)
-        entry_date = st.date_input("Date", value=today, key="manual_date")
+    reason = st.text_input("Reason (required)", value="", key="m_reason")
 
-    with col2:
-        reason = st.text_input("Reason (required)", value="", key="manual_reason")
-
-    if mode == "Add time":
-        hours = st.number_input("Hours to add", min_value=0.0, max_value=24.0, value=0.0, step=0.25)
-        if st.button("Add hours", use_container_width=True):
+    if mode == "Add hours":
+        hours = st.number_input("Hours", min_value=0.0, max_value=24.0, value=0.0, step=0.25)
+        if st.button("Save manual hours", use_container_width=True):
             if hours <= 0:
                 st.warning("Enter > 0 hours.")
             elif reason.strip() == "":
@@ -366,40 +362,37 @@ with tabs[2]:
             else:
                 add_log(entry_date, person, float(hours), reason.strip(), "manual_add")
                 add_notification(person, entry_date, float(hours), reason.strip(), "manual_add")
-                st.success("Saved manual time + notified admin.")
+                st.success("Saved + recorded reason.")
                 st.rerun()
-
     else:
         minutes = st.number_input("Minutes (+ add / - subtract)", min_value=-600, max_value=600, value=0, step=5)
-        if st.button("Apply adjustment", use_container_width=True):
+        if st.button("Save adjustment", use_container_width=True):
             if minutes == 0:
-                st.warning("Minutes must not be 0.")
+                st.warning("Minutes cannot be 0.")
             elif reason.strip() == "":
                 st.warning("Reason required.")
             else:
                 delta_hours = float(minutes) / 60.0
                 add_log(entry_date, person, delta_hours, reason.strip(), "adjustment")
                 add_notification(person, entry_date, delta_hours, reason.strip(), "adjustment")
-                st.success("Saved adjustment + notified admin.")
+                st.success("Saved + recorded reason.")
                 st.rerun()
 
 # ----------------------------
-# TAB 4: NOTIFICATIONS (EVERYONE CAN VIEW, BUT IT'S YOUR INBOX)
+# TAB 4: NOTIFICATIONS
 # ----------------------------
 with tabs[3]:
-    st.subheader("🔔 Notifications (Manual entries & adjustments)")
-    rows = fetch_notifications()
+    st.subheader("Notifications (Manual entries & adjustments)")
 
+    rows = fetch_notifications()
     if not rows:
         st.info("No notifications yet.")
     else:
-        # Simple table output without pandas (no schema issues)
-        st.write("Newest first:")
-        for created_at, p, log_date, delta_hours, reason, kind in rows[:100]:
+        for created_at, p, log_date, delta_hours, reason, kind in rows[:150]:
             st.markdown(
-                f"- **{p}** • {log_date} • **{delta_hours:+.2f} hrs** • *{kind}*  \n"
-                f"  Reason: {reason}  \n"
-                f"  _(logged {created_at})_"
+                f"- **{p}** • {log_date} • **{delta_hours:+.2f} hrs** • *{kind}*\n"
+                f"  \n  Reason: {reason}\n"
+                f"  \n  _{created_at}_"
             )
 
 # ----------------------------
@@ -407,16 +400,14 @@ with tabs[3]:
 # ----------------------------
 if person == ADMIN:
     with tabs[4]:
-        st.subheader("🧾 Logs (Admin)")
+        st.subheader("Logs (Admin only)")
         rows = fetch_logs()
         if not rows:
             st.info("No logs yet.")
         else:
-            # show latest 200
-            st.caption("Latest entries (newest first)")
-            for created_at, log_date, p, hrs, notes, source in rows[:200]:
+            for created_at, log_date, p, hrs, notes, source in rows[:300]:
                 st.markdown(
-                    f"- **{p}** • {log_date} • **{hrs:+.2f} hrs** • *{source}*  \n"
-                    f"  Notes: {notes}  \n"
-                    f"  _(logged {created_at})_"
+                    f"- **{p}** • {log_date} • **{hrs:+.2f} hrs** • *{source}*\n"
+                    f"  \n  Notes: {notes}\n"
+                    f"  \n  _{created_at}_"
                 )
