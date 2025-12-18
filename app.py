@@ -15,7 +15,7 @@ except Exception:
 # Config
 # =========================
 APP_TITLE = "⏱️ Equity Vesting Time Tracker"
-SUBTITLE = "Clock in / Clock out • Weekly goal 10 hrs • Monthly vesting 40 hrs"
+SUBTITLE = "Clock in / Clock out • Weekly goal 12 hrs • Monthly vesting 48 hrs"
 
 ADMIN_NAME = "Drew"
 PEOPLE = ["Drew", "Carson", "Kaden", "Chandler"]
