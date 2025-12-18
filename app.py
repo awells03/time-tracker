@@ -188,6 +188,13 @@ def fmt_hms(seconds: int) -> str:
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+def safe_parse_iso(ts: str) -> datetime:
+    # very defensive: never break timer math
+    try:
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return datetime.utcnow()
+
 # ----------------------------
 # Data access
 # ----------------------------
@@ -313,11 +320,11 @@ st.caption("Clock in / Clock out • Weekly goal 10 hrs • Monthly vesting 40 h
 with st.sidebar:
     st.subheader("Controls")
     person = st.selectbox("Who are you?", PEOPLE)
-    today = st.date_input("Today", value=date.today())
+    sidebar_today = st.date_input("Today", value=date.today())
     st.divider()
     st.write("Everyone can see everyone (leaderboard enabled).")
 
-# Tabs: Notifications + Logs ONLY for Drew
+# Tabs: Admin-only tabs only for Drew
 tab_names = ["⏱️ Clock In", "🏆 Leaderboard", "✍️ Manual Time"]
 if person == ADMIN:
     tab_names.append("🔔 Notifications (Admin)")
@@ -332,20 +339,37 @@ with tabs[0]:
 
     is_running, started_at, acc_sec, active_date = fetch_timer(person)
 
-    if active_date != today.isoformat() and int(is_running) == 0:
-        update_timer(person, 0, None, 0, today.isoformat())
-        is_running, started_at, acc_sec, active_date = fetch_timer(person)
+    # If running, the "truth" date is active_date (NOT whatever the sidebar says)
+    try:
+        run_date = date.fromisoformat(active_date)
+    except Exception:
+        run_date = date.today()
 
+    today_effective = run_date if int(is_running) == 1 else sidebar_today
+
+    # If not running and date changed, reset day state (safe)
+    if int(is_running) == 0 and active_date != today_effective.isoformat():
+        update_timer(person, 0, None, 0, today_effective.isoformat())
+        is_running, started_at, acc_sec, active_date = fetch_timer(person)
+        run_date = date.fromisoformat(active_date)
+        today_effective = run_date
+
+    # Auto-refresh only while running
     if int(is_running) == 1 and HAVE_AUTOREFRESH:
         st_autorefresh(interval=REFRESH_MS, key=f"tick_{person}")
 
+    # Compute seconds
     seconds = int(acc_sec)
     if int(is_running) == 1 and started_at:
-        seconds += int((datetime.utcnow() - datetime.fromisoformat(started_at)).total_seconds())
+        started_dt = safe_parse_iso(started_at)
+        seconds += int((datetime.utcnow() - started_dt).total_seconds())
+
+    seconds = max(0, seconds)
 
     if int(is_running) == 1:
-        st.success("🟢 CLOCKED IN — Timer running")
-        st.caption("Time is actively counting…")
+        st.success(f"🟢 CLOCKED IN — Timer running (saving to {run_date.isoformat()})")
+        if sidebar_today != run_date:
+            st.caption("Note: Sidebar date changes are ignored while clocked in (prevents lost time).")
     else:
         st.info("⚪ CLOCKED OUT")
 
@@ -356,23 +380,26 @@ with tabs[0]:
     with c1:
         if int(is_running) == 0:
             if st.button("▶️ Clock In", use_container_width=True):
-                update_timer(person, 1, now_utc_str(), int(acc_sec), today.isoformat())
+                # Start a fresh session for the selected date
+                update_timer(person, 1, now_utc_str(), int(acc_sec), sidebar_today.isoformat())
                 st.rerun()
         else:
             if st.button("⏸️ Clock Out (Save)", use_container_width=True):
+                # Save to the run_date (active_date), not the sidebar
                 hours = seconds / 3600.0
-                add_log(today, person, hours, "Clocked session", "timer")
-                update_timer(person, 0, None, 0, today.isoformat())
-                st.success(f"Saved {hours:.2f} hrs")
+                if hours > 0:
+                    add_log(run_date, person, hours, "Clocked session", "timer")
+                update_timer(person, 0, None, 0, run_date.isoformat())
+                st.success(f"Saved {hours:.2f} hrs to {run_date.isoformat()}")
                 st.rerun()
 
     with c2:
-        wk = clamp_nonneg(week_totals(today).get(person, 0.0))
+        wk = clamp_nonneg(week_totals(today_effective).get(person, 0.0))
         st.metric("This week", f"{wk:.2f} hrs")
         st.progress(min(1.0, wk / WEEKLY_TARGET) if WEEKLY_TARGET else 0.0)
 
     with c3:
-        mo = clamp_nonneg(month_totals(today).get(person, 0.0))
+        mo = clamp_nonneg(month_totals(today_effective).get(person, 0.0))
         st.metric("This month", f"{mo:.2f} hrs")
         st.progress(min(1.0, mo / MONTHLY_TARGET) if MONTHLY_TARGET else 0.0)
 
@@ -385,19 +412,19 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("Leaderboard")
 
-    wk = week_totals(today)
-    mo = month_totals(today)
+    wk = week_totals(sidebar_today)
+    mo = month_totals(sidebar_today)
 
     ordered = sorted(PEOPLE, key=lambda p: (wk.get(p, 0.0), mo.get(p, 0.0)), reverse=True)
 
-    st.caption(f"Week starting {week_start(today)} • Goal {WEEKLY_TARGET:.0f} hrs")
+    st.caption(f"Week starting {week_start(sidebar_today)} • Goal {WEEKLY_TARGET:.0f} hrs")
     for i, p in enumerate(ordered, start=1):
         hrs = clamp_nonneg(wk.get(p, 0.0))
         st.write(f"**#{i} {p}** — {hrs:.2f} hrs")
         st.progress(min(1.0, hrs / WEEKLY_TARGET) if WEEKLY_TARGET else 0.0)
 
     st.divider()
-    st.caption(f"Month starting {month_start(today)} • Vesting {MONTHLY_TARGET:.0f} hrs")
+    st.caption(f"Month starting {month_start(sidebar_today)} • Vesting {MONTHLY_TARGET:.0f} hrs")
     for p in PEOPLE:
         hrs = clamp_nonneg(mo.get(p, 0.0))
         status = "✅ VESTED" if hrs >= MONTHLY_TARGET else "⏳ In progress"
@@ -410,12 +437,13 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("Manual Time (Reason Required)")
 
-    entry_date = st.date_input("Date", value=today, key="m_date")
-    mode = st.radio("Type", ["Add hours", "Adjust (+/- minutes)"], horizontal=True)
-    reason = st.text_input("Reason (required)", value="", key="m_reason")
+    entry_date = st.date_input("Date", value=sidebar_today, key="m_date")
+    mode = st.radio("Type", ["Add hours", "Adjust (+/- minutes)"], horizontal=True, key="m_mode")
+    reason = st.text_input("Reason (required)", value=st.session_state.get("m_reason", ""), key="m_reason")
 
     if mode == "Add hours":
-        hours = st.number_input("Hours", min_value=0.0, max_value=24.0, value=0.0, step=0.25)
+        hours = st.number_input("Hours", min_value=0.0, max_value=24.0, value=float(st.session_state.get("m_hours", 0.0)),
+                                step=0.25, key="m_hours")
         if st.button("Save manual hours", use_container_width=True):
             if hours <= 0:
                 st.warning("Enter > 0 hours.")
@@ -424,10 +452,20 @@ with tabs[2]:
             else:
                 add_log(entry_date, person, float(hours), reason.strip(), "manual_add")
                 add_notification(person, entry_date, float(hours), reason.strip(), "manual_add")
+
+                # CLEAR form so they can’t double-submit accidentally
+                st.session_state["m_reason"] = ""
+                st.session_state["m_hours"] = 0.0
+
                 st.success("Saved + recorded reason.")
                 st.rerun()
     else:
-        minutes = st.number_input("Minutes (+ add / - subtract)", min_value=-600, max_value=600, value=0, step=5)
+        minutes = st.number_input(
+            "Minutes (+ add / - subtract)",
+            min_value=-600, max_value=600,
+            value=int(st.session_state.get("m_minutes", 0)),
+            step=5, key="m_minutes"
+        )
         if st.button("Save adjustment", use_container_width=True):
             if minutes == 0:
                 st.warning("Minutes cannot be 0.")
@@ -437,6 +475,11 @@ with tabs[2]:
                 delta_hours = float(minutes) / 60.0
                 add_log(entry_date, person, delta_hours, reason.strip(), "adjustment")
                 add_notification(person, entry_date, delta_hours, reason.strip(), "adjustment")
+
+                # CLEAR form so they can’t double-submit accidentally
+                st.session_state["m_reason"] = ""
+                st.session_state["m_minutes"] = 0
+
                 st.success("Saved + recorded reason.")
                 st.rerun()
 
