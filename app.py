@@ -1,89 +1,91 @@
-import streamlit as st
+import os
 import sqlite3
-import time
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
-# Optional autorefresh (safe if installed)
+import streamlit as st
+
+# Optional live refresh (nice-to-have; app works without it)
 try:
     from streamlit_autorefresh import st_autorefresh
-    HAVE_AUTOREFRESH = True
 except Exception:
-    HAVE_AUTOREFRESH = False
+    st_autorefresh = None
 
-# ----------------------------
-# SETTINGS
-# ----------------------------
-DB_PATH = "time_tracker.db"
 
+# =========================
+# Config
+# =========================
+APP_TITLE = "⏱️ Equity Vesting Time Tracker"
+SUBTITLE = "Clock in / Clock out • Weekly goal 10 hrs • Monthly vesting 40 hrs"
+
+ADMIN_NAME = "Drew"
 PEOPLE = ["Drew", "Carson", "Kaden", "Chandler"]
-ADMIN = "Drew"
 
-WEEKLY_TARGET = 10.0
-MONTHLY_TARGET = 40.0
-WEEK_START = 0  # Monday
+WEEKLY_GOAL_HRS = 10.0
+MONTHLY_GOAL_HRS = 40.0
 
-REFRESH_MS = 1200  # only while clocked in
+DB_DIR = "data"
+DB_PATH = os.path.join(DB_DIR, "time_tracker.db")
 
 
-# ----------------------------
+# =========================
 # Helpers
-# ----------------------------
+# =========================
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def iso_utc(dt: datetime) -> str:
+    # Store as ISO string with Z offset
+    return dt.astimezone(timezone.utc).isoformat()
+
+def parse_iso(dt_str: str) -> datetime:
+    return datetime.fromisoformat(dt_str)
+
 def clamp_nonneg(x: float) -> float:
     try:
-        return max(0.0, float(x or 0.0))
+        x = float(x)
     except Exception:
         return 0.0
-
-
-def now_utc_str() -> str:
-    return datetime.utcnow().isoformat()
-
-
-def fmt_hms(seconds: int) -> str:
-    seconds = max(0, int(seconds))
-    h = seconds // 3600
-    m = (seconds % 3600) // 60
-    s = seconds % 60
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
+    return max(0.0, x)
 
 def week_start(d: date) -> date:
-    return d - timedelta(days=(d.weekday() - WEEK_START) % 7)
-
+    # Monday start
+    return d - timedelta(days=d.weekday())
 
 def month_start(d: date) -> date:
-    return d.replace(day=1)
-
+    return date(d.year, d.month, 1)
 
 def month_end_exclusive(d: date) -> date:
-    start = month_start(d)
-    if start.month == 12:
-        return date(start.year + 1, 1, 1)
-    return date(start.year, start.month + 1, 1)
+    # first day of next month
+    if d.month == 12:
+        return date(d.year + 1, 1, 1)
+    return date(d.year, d.month + 1, 1)
 
 
-# ----------------------------
-# DB layer
-# ----------------------------
-def db():
-    con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
-    cur = con.cursor()
-    cur.execute("PRAGMA journal_mode=WAL;")
-    cur.execute("PRAGMA synchronous=NORMAL;")
+# =========================
+# Database
+# =========================
+def db() -> sqlite3.Connection:
+    os.makedirs(DB_DIR, exist_ok=True)
+    con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL;")
+    con.execute("PRAGMA foreign_keys=ON;")
     return con
 
-
-def table_exists(cur, name: str) -> bool:
-    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,))
+def table_exists(cur: sqlite3.Cursor, name: str) -> bool:
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (name,))
     return cur.fetchone() is not None
 
 
-def get_cols(cur, table: str) -> set:
-    cur.execute(f"PRAGMA table_info({table})")
-    return {r[1] for r in cur.fetchall()}
-
-
-def migrate_logs(cur):
+def migrate_logs(cur: sqlite3.Cursor):
+    """
+    logs:
+      created_at TEXT (ISO UTC)
+      log_date   TEXT (YYYY-MM-DD)
+      person     TEXT
+      hours      REAL  (can be negative for adjustments)
+      notes      TEXT
+      source     TEXT  ('timer' | 'manual_add' | etc)
+    """
     required = {"created_at", "log_date", "person", "hours", "notes", "source"}
 
     if not table_exists(cur, "logs"):
@@ -100,8 +102,16 @@ def migrate_logs(cur):
         """)
         return
 
-    existing = get_cols(cur, "logs")
-    if required.issubset(existing):
+    # If columns missing OR log_date isn't TEXT affinity, rebuild safely
+    cur.execute("PRAGMA table_info(logs)")
+    info = cur.fetchall()
+    existing_cols = {r[1] for r in info}
+    col_types = {r[1]: (r[2] or "").upper() for r in info}
+    log_date_type = col_types.get("log_date", "")
+
+    needs_rebuild = (not required.issubset(existing_cols)) or ("TEXT" not in log_date_type)
+
+    if not needs_rebuild:
         return
 
     cur.execute("""
@@ -116,12 +126,17 @@ def migrate_logs(cur):
         )
     """)
 
-    created_at_expr = "created_at" if "created_at" in existing else "datetime('now')"
-    log_date_expr   = "log_date"   if "log_date" in existing else "date('now')"
-    person_expr     = "person"     if "person" in existing else "''"
-    hours_expr      = "hours"      if "hours" in existing else "0.0"
-    notes_expr      = "notes"      if "notes" in existing else "''"
-    source_expr     = "source"     if "source" in existing else "'legacy'"
+    created_at_expr = "created_at" if "created_at" in existing_cols else "datetime('now')"
+    person_expr     = "person"     if "person" in existing_cols else "''"
+    hours_expr      = "hours"      if "hours" in existing_cols else "0.0"
+    notes_expr      = "notes"      if "notes" in existing_cols else "''"
+    source_expr     = "source"     if "source" in existing_cols else "'legacy'"
+
+    # Normalize log_date to YYYY-MM-DD using SQLite date()
+    if "log_date" in existing_cols:
+        log_date_expr = "COALESCE(date(log_date), date('now'))"
+    else:
+        log_date_expr = "date('now')"
 
     cur.execute(f"""
         INSERT INTO logs_new (created_at, log_date, person, hours, notes, source)
@@ -133,150 +148,146 @@ def migrate_logs(cur):
     cur.execute("ALTER TABLE logs_new RENAME TO logs")
 
 
-def migrate_notifications(cur):
-    required = {"created_at", "person", "log_date", "delta_hours", "reason", "kind"}
-
-    if not table_exists(cur, "notifications"):
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS notifications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                created_at TEXT NOT NULL,
-                person TEXT NOT NULL,
-                log_date TEXT NOT NULL,
-                delta_hours REAL NOT NULL,
-                reason TEXT NOT NULL,
-                kind TEXT NOT NULL
-            )
-        """)
-        return
-
-    existing = get_cols(cur, "notifications")
-    if required.issubset(existing):
-        return
-
+def migrate_active_sessions(cur: sqlite3.Cursor):
+    """
+    active_sessions:
+      person     TEXT PRIMARY KEY
+      start_at   TEXT (ISO UTC)
+      log_date   TEXT (YYYY-MM-DD)  -- the day we intend to save to
+    """
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS notifications_new (
+        CREATE TABLE IF NOT EXISTS active_sessions (
+            person TEXT PRIMARY KEY,
+            start_at TEXT NOT NULL,
+            log_date TEXT NOT NULL
+        )
+    """)
+
+def migrate_notifications(cur: sqlite3.Cursor):
+    """
+    notifications:
+      created_at TEXT
+      person     TEXT
+      log_date   TEXT
+      delta_hours REAL
+      reason     TEXT
+      source     TEXT
+      seen       INTEGER (0/1)
+    """
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS notifications (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
             person TEXT NOT NULL,
             log_date TEXT NOT NULL,
             delta_hours REAL NOT NULL,
             reason TEXT NOT NULL,
-            kind TEXT NOT NULL
+            source TEXT NOT NULL,
+            seen INTEGER NOT NULL DEFAULT 0
         )
     """)
 
-    created_at_expr = "created_at" if "created_at" in existing else "datetime('now')"
-    person_expr     = "person"     if "person" in existing else "''"
-    log_date_expr   = "log_date"   if "log_date" in existing else "date('now')"
-    delta_expr      = "delta_hours" if "delta_hours" in existing else "0.0"
-    reason_expr     = "reason"     if "reason" in existing else "''"
-    kind_expr       = "kind"       if "kind" in existing else "'legacy'"
-
-    cur.execute(f"""
-        INSERT INTO notifications_new (created_at, person, log_date, delta_hours, reason, kind)
-        SELECT {created_at_expr}, {person_expr}, {log_date_expr}, {delta_expr}, {reason_expr}, {kind_expr}
-        FROM notifications
-    """)
-
-    cur.execute("DROP TABLE notifications")
-    cur.execute("ALTER TABLE notifications_new RENAME TO notifications")
-
-
-def init_db():
+def ensure_schema():
     con = db()
     cur = con.cursor()
-
-    # Timers table: started_at stored as UNIX epoch seconds (REAL)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS timers (
-            person TEXT PRIMARY KEY,
-            is_running INTEGER NOT NULL,
-            started_at REAL,
-            accumulated_seconds INTEGER NOT NULL,
-            active_date TEXT NOT NULL
-        )
-    """)
-
     migrate_logs(cur)
+    migrate_active_sessions(cur)
     migrate_notifications(cur)
-
-    today_iso = date.today().isoformat()
-    for p in PEOPLE:
-        cur.execute("""
-            INSERT OR IGNORE INTO timers (person, is_running, started_at, accumulated_seconds, active_date)
-            VALUES (?, 0, NULL, 0, ?)
-        """, (p, today_iso))
-
     con.commit()
     con.close()
 
 
-def fetch_timer(person: str):
-    con = db()
-    cur = con.cursor()
-    cur.execute("SELECT is_running, started_at, accumulated_seconds, active_date FROM timers WHERE person=?", (person,))
-    row = cur.fetchone()
-    con.close()
-    return row if row else (0, None, 0, date.today().isoformat())
-
-
-def update_timer(person: str, is_running: int, started_at, accumulated_seconds: int, active_date: str):
-    con = db()
-    cur = con.cursor()
-    cur.execute("""
-        UPDATE timers
-        SET is_running=?, started_at=?, accumulated_seconds=?, active_date=?
-        WHERE person=?
-    """, (int(is_running), started_at, int(accumulated_seconds), active_date, person))
-    con.commit()
-    con.close()
-
-
-def add_log(log_date: date, person: str, hours: float, notes: str, source: str):
+# =========================
+# DB Ops
+# =========================
+def log_event(person: str, log_date_str: str, hours: float, notes: str, source: str):
     con = db()
     cur = con.cursor()
     cur.execute("""
         INSERT INTO logs (created_at, log_date, person, hours, notes, source)
         VALUES (?, ?, ?, ?, ?, ?)
-    """, (now_utc_str(), log_date.isoformat(), person, float(hours), notes, source))
+    """, (iso_utc(now_utc()), log_date_str, person, float(hours), notes or "", source))
     con.commit()
     con.close()
 
-
-def add_notification(person: str, log_date: date, delta_hours: float, reason: str, kind: str):
+def add_notification(person: str, log_date_str: str, delta_hours: float, reason: str, source: str):
     con = db()
     cur = con.cursor()
     cur.execute("""
-        INSERT INTO notifications (created_at, person, log_date, delta_hours, reason, kind)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (now_utc_str(), person, log_date.isoformat(), float(delta_hours), reason, kind))
+        INSERT INTO notifications (created_at, person, log_date, delta_hours, reason, source, seen)
+        VALUES (?, ?, ?, ?, ?, ?, 0)
+    """, (iso_utc(now_utc()), person, log_date_str, float(delta_hours), reason or "", source))
     con.commit()
     con.close()
 
+def get_active_session(person: str):
+    con = db()
+    cur = con.cursor()
+    cur.execute("SELECT start_at, log_date FROM active_sessions WHERE person=?;", (person,))
+    row = cur.fetchone()
+    con.close()
+    if not row:
+        return None
+    return {"start_at": row[0], "log_date": row[1]}
 
-def sum_hours(person: str, start: date, end_exclusive: date) -> float:
+def start_session(person: str, log_date_str: str):
+    con = db()
+    cur = con.cursor()
+    cur.execute("""
+        INSERT INTO active_sessions (person, start_at, log_date)
+        VALUES (?, ?, ?)
+        ON CONFLICT(person) DO UPDATE SET start_at=excluded.start_at, log_date=excluded.log_date
+    """, (person, iso_utc(now_utc()), log_date_str))
+    con.commit()
+    con.close()
+
+def stop_session(person: str):
+    """
+    Returns (log_date_str, elapsed_hours) or (None, 0) if not running.
+    """
+    active = get_active_session(person)
+    if not active:
+        return None, 0.0
+
+    start_at = parse_iso(active["start_at"])
+    log_date_str = active["log_date"]
+
+    elapsed = (now_utc() - start_at).total_seconds()
+    elapsed_hours = max(0.0, elapsed / 3600.0)
+
+    con = db()
+    cur = con.cursor()
+    cur.execute("DELETE FROM active_sessions WHERE person=?;", (person,))
+    con.commit()
+    con.close()
+
+    return log_date_str, elapsed_hours
+
+
+def sum_hours(person: str, start_d: date, end_exclusive: date) -> float:
     con = db()
     cur = con.cursor()
     cur.execute("""
         SELECT COALESCE(SUM(hours), 0)
         FROM logs
-        WHERE person=? AND log_date >= ? AND log_date < ?
-    """, (person, start.isoformat(), end_exclusive.isoformat()))
+        WHERE person=?
+          AND date(log_date) >= date(?)
+          AND date(log_date) <  date(?)
+    """, (person, start_d.isoformat(), end_exclusive.isoformat()))
     v = cur.fetchone()[0]
     con.close()
     return clamp_nonneg(v)
 
-
-def sum_hours_all(start: date, end_exclusive: date):
+def sum_hours_all(start_d: date, end_exclusive: date) -> dict:
     con = db()
     cur = con.cursor()
     cur.execute("""
         SELECT person, COALESCE(SUM(hours), 0)
         FROM logs
-        WHERE log_date >= ? AND log_date < ?
+        WHERE date(log_date) >= date(?)
+          AND date(log_date) <  date(?)
         GROUP BY person
-    """, (start.isoformat(), end_exclusive.isoformat()))
+    """, (start_d.isoformat(), end_exclusive.isoformat()))
     rows = cur.fetchall()
     con.close()
     out = {p: 0.0 for p in PEOPLE}
@@ -284,290 +295,296 @@ def sum_hours_all(start: date, end_exclusive: date):
         out[p] = clamp_nonneg(v)
     return out
 
-
-def fetch_logs_for_person_date(person: str, d: date, limit=50):
+def fetch_recent_logs(limit: int = 50, person: str | None = None):
     con = db()
     cur = con.cursor()
-    cur.execute("""
-        SELECT created_at, hours, notes, source
-        FROM logs
-        WHERE person=? AND log_date=?
-        ORDER BY created_at DESC
-        LIMIT ?
-    """, (person, d.isoformat(), int(limit)))
+    if person:
+        cur.execute("""
+            SELECT created_at, log_date, person, hours, source, notes
+            FROM logs
+            WHERE person=?
+            ORDER BY datetime(created_at) DESC
+            LIMIT ?
+        """, (person, int(limit)))
+    else:
+        cur.execute("""
+            SELECT created_at, log_date, person, hours, source, notes
+            FROM logs
+            ORDER BY datetime(created_at) DESC
+            LIMIT ?
+        """, (int(limit),))
     rows = cur.fetchall()
     con.close()
     return rows
 
-
-def fetch_notifications(limit=200):
+def fetch_notifications(limit: int = 50):
     con = db()
     cur = con.cursor()
     cur.execute("""
-        SELECT created_at, person, log_date, delta_hours, reason, kind
+        SELECT id, created_at, person, log_date, delta_hours, reason, source, seen
         FROM notifications
-        ORDER BY created_at DESC
+        ORDER BY datetime(created_at) DESC
         LIMIT ?
     """, (int(limit),))
     rows = cur.fetchall()
     con.close()
     return rows
 
-
-def fetch_logs(limit=300):
+def mark_notifications_seen(ids):
+    if not ids:
+        return
     con = db()
     cur = con.cursor()
-    cur.execute("""
-        SELECT created_at, log_date, person, hours, notes, source
-        FROM logs
-        ORDER BY log_date DESC, created_at DESC
-        LIMIT ?
-    """, (int(limit),))
-    rows = cur.fetchall()
+    cur.executemany("UPDATE notifications SET seen=1 WHERE id=?;", [(int(i),) for i in ids])
+    con.commit()
     con.close()
-    return rows
 
 
-# ----------------------------
-# APP
-# ----------------------------
-st.set_page_config(page_title="Equity Vesting Time Tracker", layout="wide")
-init_db()
+# =========================
+# UI
+# =========================
+st.set_page_config(page_title="Equity Vesting Tracker", layout="wide")
+ensure_schema()
 
-st.title("⏱️ Equity Vesting Time Tracker")
-st.caption("Clock in / Clock out • Weekly goal 10 hrs • Monthly vesting 40 hrs")
+# Sidebar controls
+st.sidebar.markdown("### Controls")
+person = st.sidebar.selectbox("Who are you?", PEOPLE, index=0)
 
-with st.sidebar:
-    st.subheader("Controls")
-    person = st.selectbox("Who are you?", PEOPLE)
-    sidebar_today = st.date_input("Today", value=date.today())
-    st.divider()
-    st.write("Everyone can see everyone (leaderboard enabled).")
+today_default = date.today()
+selected_date = st.sidebar.date_input("Today", value=today_default)
 
-tabs = ["⏱️ Clock In", "🏆 Leaderboard", "✍️ Manual Time"]
-if person == ADMIN:
+st.sidebar.markdown("---")
+st.sidebar.caption("Everyone can see everyone (leaderboard enabled).")
+
+live_timer = False
+if st_autorefresh is not None:
+    live_timer = st.sidebar.toggle("Live timer (optional)", value=False, help="Auto-refresh while clocked in.")
+
+# Header
+st.title(APP_TITLE)
+st.caption(SUBTITLE)
+
+is_admin = (person == ADMIN_NAME)
+
+tabs = ["🕒 Clock In", "🏆 Leaderboard", "✍️ Manual Time"]
+if is_admin:
     tabs += ["🔔 Notifications (Admin)", "🧾 Logs (Admin only)"]
-t = st.tabs(tabs)
 
-# ----------------------------
-# TAB: CLOCK IN
-# ----------------------------
-with t[0]:
+t_clock, t_leader, t_manual, *admin_tabs = st.tabs(tabs)
+
+# -------------------------
+# CLOCK IN TAB
+# -------------------------
+with t_clock:
     st.subheader("Clock In / Clock Out")
 
-    is_running, started_at, acc_sec, active_date = fetch_timer(person)
+    active = get_active_session(person)
+    running = active is not None
 
-    # Resolve the "save date" for the running session (locked in)
-    try:
-        run_date = date.fromisoformat(active_date)
-    except Exception:
-        run_date = sidebar_today
+    # Live refresh only while running (and only if user toggled it)
+    if running and live_timer and st_autorefresh is not None:
+        # Refresh modestly to reduce "header popping"
+        st_autorefresh(interval=2000, key=f"autorefresh_{person}")
 
-    # If not running, the effective date is sidebar date
-    effective_date = run_date if int(is_running) == 1 else sidebar_today
-
-    # If not running and user changed the sidebar date, reset internal day timer state
-    if int(is_running) == 0 and active_date != effective_date.isoformat():
-        update_timer(person, 0, None, 0, effective_date.isoformat())
-        is_running, started_at, acc_sec, active_date = fetch_timer(person)
-        run_date = date.fromisoformat(active_date)
-        effective_date = sidebar_today
-
-    # Auto refresh only while running
-    if int(is_running) == 1 and HAVE_AUTOREFRESH:
-        st_autorefresh(interval=REFRESH_MS, key=f"tick_{person}")
-
-    # Compute current seconds (epoch math)
-    seconds = int(acc_sec or 0)
-    if int(is_running) == 1 and started_at is not None:
-        try:
-            started_epoch = float(started_at)
-        except Exception:
-            started_epoch = time.time()
-        seconds += int(time.time() - started_epoch)
-
-    seconds = max(0, seconds)
-    session_hours = seconds / 3600.0
-
-    if int(is_running) == 1:
-        st.success(f"🟢 CLOCKED IN — Timer running (saving to {run_date.isoformat()})")
-        if sidebar_today != run_date:
-            st.caption("Sidebar date is ignored while clocked in (prevents lost time).")
+    # Status banner
+    if running:
+        st.success(f"🟢 CLOCKED IN — Timer running (saving to {active['log_date']})")
     else:
         st.info("⚪ CLOCKED OUT")
 
-    st.markdown(f"## {fmt_hms(seconds)}")
+    # Timer display
+    timer_col, wk_col, mo_col = st.columns([1.2, 1, 1])
 
-    c1, c2, c3 = st.columns([1, 1, 1])
+    with timer_col:
+        if running:
+            start_at = parse_iso(active["start_at"])
+            elapsed_sec = max(0.0, (now_utc() - start_at).total_seconds())
+        else:
+            elapsed_sec = 0.0
 
-    # Logged totals (real saved DB totals)
-    wk_start = week_start(effective_date)
-    wk_end = wk_start + timedelta(days=7)
-    mo_start = month_start(effective_date)
-    mo_end = month_end_exclusive(effective_date)
+        hh = int(elapsed_sec // 3600)
+        mm = int((elapsed_sec % 3600) // 60)
+        ss = int(elapsed_sec % 60)
+        st.markdown(
+            f"<div style='font-size:56px; font-weight:700; line-height:1.0'>{hh:02d}:{mm:02d}:{ss:02d}</div>",
+            unsafe_allow_html=True
+        )
 
-    wk_logged = sum_hours(person, wk_start, wk_end)
-    mo_logged = sum_hours(person, mo_start, mo_end)
-
-    # Dynamic "projected" totals if running
-    wk_projected = wk_logged + (session_hours if int(is_running) == 1 else 0.0)
-    mo_projected = mo_logged + (session_hours if int(is_running) == 1 else 0.0)
-
-    with c1:
-        if int(is_running) == 0:
+        # Buttons
+        if not running:
             if st.button("▶️ Clock In", use_container_width=True):
-                # Lock-in date and store start epoch
-                update_timer(person, 1, time.time(), 0, sidebar_today.isoformat())
+                # Always save to selected_date
+                start_session(person, selected_date.isoformat())
                 st.rerun()
         else:
             if st.button("⏸️ Clock Out (Save)", use_container_width=True):
-                # Re-read timer to avoid race/rerun issues
-                is_running2, started_at2, acc_sec2, active_date2 = fetch_timer(person)
-                try:
-                    save_date = date.fromisoformat(active_date2)
-                except Exception:
-                    save_date = date.today()
+                log_date_str, elapsed_hours = stop_session(person)
+                elapsed_hours = max(0.0, elapsed_hours)
 
-                sec2 = int(acc_sec2 or 0)
-                if int(is_running2) == 1 and started_at2 is not None:
-                    try:
-                        sec2 += int(time.time() - float(started_at2))
-                    except Exception:
-                        pass
-
-                sec2 = max(0, sec2)
-                hrs2 = sec2 / 3600.0
-
-                # Save only if at least 1 second
-                if sec2 >= 1:
-                    add_log(save_date, person, hrs2, "Clocked session", "timer")
-
-                # Reset timer state
-                update_timer(person, 0, None, 0, save_date.isoformat())
-
-                st.success(f"Saved {hrs2:.4f} hrs to {save_date.isoformat()}")
+                # Save to logs
+                if log_date_str and elapsed_hours > 0:
+                    log_event(
+                        person=person,
+                        log_date_str=log_date_str,
+                        hours=elapsed_hours,
+                        notes="Clocked session",
+                        source="timer"
+                    )
                 st.rerun()
 
-    with c2:
-        label = "This week (if you clock out now)" if int(is_running) == 1 else "This week"
-        st.metric(label, f"{wk_projected:.2f} hrs")
-        st.progress(min(1.0, wk_projected / WEEKLY_TARGET) if WEEKLY_TARGET else 0.0)
+        # Friendly hint if live timer is off
+        if running and (not live_timer):
+            st.caption("Tip: toggle **Live timer** in the sidebar (optional), or just hit refresh whenever.")
 
-    with c3:
-        label = "This month (if you clock out now)" if int(is_running) == 1 else "This month"
-        st.metric(label, f"{mo_projected:.2f} hrs")
-        st.progress(min(1.0, mo_projected / MONTHLY_TARGET) if MONTHLY_TARGET else 0.0)
+    # Totals (these week/month MUST reflect timer logs)
+    w0 = week_start(selected_date)
+    w1 = w0 + timedelta(days=7)
+    m0 = month_start(selected_date)
+    m1 = month_end_exclusive(selected_date)
+
+    week_total = sum_hours(person, w0, w1)
+    month_total = sum_hours(person, m0, m1)
+
+    with wk_col:
+        st.markdown("**This week**")
+        st.markdown(f"<div style='font-size:44px; font-weight:700'>{week_total:.2f} hrs</div>", unsafe_allow_html=True)
+        st.progress(min(1.0, week_total / WEEKLY_GOAL_HRS) if WEEKLY_GOAL_HRS > 0 else 0.0)
+
+    with mo_col:
+        st.markdown("**This month**")
+        st.markdown(f"<div style='font-size:44px; font-weight:700'>{month_total:.2f} hrs</div>", unsafe_allow_html=True)
+        st.progress(min(1.0, month_total / MONTHLY_GOAL_HRS) if MONTHLY_GOAL_HRS > 0 else 0.0)
 
     st.divider()
-    st.caption(f"Saved sessions for **{person}** on **{effective_date.isoformat()}** (proof it saved):")
-    rows = fetch_logs_for_person_date(person, effective_date)
-    if not rows:
-        st.write("No sessions saved yet for this date.")
-    else:
-        for created_at, hrs, notes, source in rows:
-            st.write(f"- {created_at} • **{float(hrs):.4f} hrs** • {source} • {notes}")
 
-# ----------------------------
-# TAB: LEADERBOARD
-# ----------------------------
-with t[1]:
+    # Proof/Recent sessions (helpful while testing)
+    recent = fetch_recent_logs(limit=12, person=person)
+    st.caption(f"Saved sessions for **{person}** (recent):")
+    if not recent:
+        st.write("No saved sessions yet.")
+    else:
+        for created_at, log_date, p, hrs, src, notes in recent:
+            st.write(f"• {created_at} • {log_date} • **{hrs:.4f} hrs** • `{src}` • {notes}")
+
+
+# -------------------------
+# LEADERBOARD TAB
+# -------------------------
+with t_leader:
     st.subheader("Leaderboard")
 
-    wk_s = week_start(sidebar_today)
-    wk_e = wk_s + timedelta(days=7)
-    mo_s = month_start(sidebar_today)
-    mo_e = month_end_exclusive(sidebar_today)
+    # Week leaderboard
+    w0 = week_start(selected_date)
+    w1 = w0 + timedelta(days=7)
+    totals_week = sum_hours_all(w0, w1)
 
-    wk_all = sum_hours_all(wk_s, wk_e)
-    mo_all = sum_hours_all(mo_s, mo_e)
-
-    ordered = sorted(PEOPLE, key=lambda p: wk_all.get(p, 0.0), reverse=True)
-
-    st.caption(f"Week starting {wk_s.isoformat()} • Goal {WEEKLY_TARGET:.0f} hrs")
-    for i, p in enumerate(ordered, start=1):
-        hrs = clamp_nonneg(wk_all.get(p, 0.0))
-        st.write(f"**#{i} {p}** — {hrs:.2f} hrs")
-        st.progress(min(1.0, hrs / WEEKLY_TARGET) if WEEKLY_TARGET else 0.0)
+    st.caption(f"Week starting {w0.isoformat()} • Goal {WEEKLY_GOAL_HRS:.0f} hrs")
+    ranked_week = sorted(totals_week.items(), key=lambda kv: kv[1], reverse=True)
+    for i, (p, hrs) in enumerate(ranked_week, start=1):
+        st.markdown(f"**#{i} {p} — {hrs:.2f} hrs**")
+        st.progress(min(1.0, hrs / WEEKLY_GOAL_HRS) if WEEKLY_GOAL_HRS > 0 else 0.0)
 
     st.divider()
-    st.caption(f"Month starting {mo_s.isoformat()} • Vesting {MONTHLY_TARGET:.0f} hrs")
-    for p in PEOPLE:
-        hrs = clamp_nonneg(mo_all.get(p, 0.0))
-        status = "✅ VESTED" if hrs >= MONTHLY_TARGET else "⏳ In progress"
-        st.write(f"**{p}** — {hrs:.2f} hrs • {status}")
-        st.progress(min(1.0, hrs / MONTHLY_TARGET) if MONTHLY_TARGET else 0.0)
 
-# ----------------------------
-# TAB: MANUAL TIME (FIXED)
-# ----------------------------
-with t[2]:
-    st.subheader("Manual Time (Reason Required)")
-    st.caption("This uses a form with clear-on-submit so it never crashes and it clears inputs automatically.")
+    # Month leaderboard
+    m0 = month_start(selected_date)
+    m1 = month_end_exclusive(selected_date)
+    totals_month = sum_hours_all(m0, m1)
 
-    with st.form("manual_time_form", clear_on_submit=True):
-        entry_date = st.date_input("Date", value=sidebar_today)
-        mode = st.radio("Type", ["Add hours", "Adjust (+/- minutes)"], horizontal=True)
+    st.caption(f"Month starting {m0.isoformat()} • Vesting {MONTHLY_GOAL_HRS:.0f} hrs")
+    ranked_month = sorted(totals_month.items(), key=lambda kv: kv[1], reverse=True)
+    for p, hrs in ranked_month:
+        status = "✅ Vested" if hrs >= MONTHLY_GOAL_HRS else "⏳ In progress"
+        st.markdown(f"**{p} — {hrs:.2f} hrs** • {status}")
+        st.progress(min(1.0, hrs / MONTHLY_GOAL_HRS) if MONTHLY_GOAL_HRS > 0 else 0.0)
 
-        reason = st.text_input("Reason (required)")
 
-        if mode == "Add hours":
-            hours = st.number_input("Hours", min_value=0.0, max_value=24.0, value=0.0, step=0.25)
-            submitted = st.form_submit_button("Save manual hours", use_container_width=True)
+# -------------------------
+# MANUAL TIME TAB
+# -------------------------
+with t_manual:
+    st.subheader("Manual Time")
+    st.caption("If you add manual time, a **reason is required** and it sends a notification to Drew.")
 
-            if submitted:
-                if hours <= 0:
-                    st.warning("Enter > 0 hours.")
-                elif reason.strip() == "":
-                    st.warning("Reason required.")
-                else:
-                    add_log(entry_date, person, float(hours), reason.strip(), "manual_add")
-                    add_notification(person, entry_date, float(hours), reason.strip(), "manual_add")
-                    st.success("Saved.")
-                    st.rerun()
+    # Use a form so it auto-clears on submit
+    with st.form("manual_form", clear_on_submit=True):
+        colA, colB = st.columns([1, 1])
+        with colA:
+            m_date = st.date_input("Date to apply manual time", value=selected_date, key="m_date")
+            m_hours = st.number_input(
+                "Hours (use negative to subtract)",
+                value=0.50,
+                step=0.25,
+                format="%.2f",
+                key="m_hours"
+            )
+        with colB:
+            m_reason = st.text_input("Reason (required)", value="", key="m_reason", placeholder="e.g., Forgot to clock in")
 
+        submit = st.form_submit_button("Save manual hours", use_container_width=True)
+
+    if submit:
+        if not str(m_reason).strip():
+            st.error("Reason is required for manual time.")
         else:
-            minutes = st.number_input("Minutes (+ add / - subtract)", min_value=-600, max_value=600, value=0, step=5)
-            submitted = st.form_submit_button("Save adjustment", use_container_width=True)
+            # Log it
+            log_event(
+                person=person,
+                log_date_str=m_date.isoformat(),
+                hours=float(m_hours),
+                notes=m_reason.strip(),
+                source="manual_add"
+            )
+            # Notify admin
+            add_notification(
+                person=person,
+                log_date_str=m_date.isoformat(),
+                delta_hours=float(m_hours),
+                reason=m_reason.strip(),
+                source="manual_add"
+            )
+            st.success("Saved manual time ✅ (and notified Drew).")
+            st.rerun()
 
-            if submitted:
-                if minutes == 0:
-                    st.warning("Minutes cannot be 0.")
-                elif reason.strip() == "":
-                    st.warning("Reason required.")
-                else:
-                    delta_hours = float(minutes) / 60.0
-                    # Floor protection is handled in totals via clamp_nonneg
-                    add_log(entry_date, person, delta_hours, reason.strip(), "adjustment")
-                    add_notification(person, entry_date, delta_hours, reason.strip(), "adjustment")
-                    st.success("Saved.")
-                    st.rerun()
 
-# ----------------------------
-# ADMIN: Notifications + Logs
-# ----------------------------
-if person == ADMIN:
-    with t[3]:
+# -------------------------
+# ADMIN: NOTIFICATIONS
+# -------------------------
+if is_admin and len(admin_tabs) >= 1:
+    with admin_tabs[0]:
         st.subheader("Notifications (Admin)")
-        rows = fetch_notifications()
-        if not rows:
-            st.info("No notifications yet.")
+
+        notes = fetch_notifications(limit=80)
+        if not notes:
+            st.write("No notifications yet.")
         else:
-            for created_at, p, log_date, delta_hours, reason, kind in rows[:200]:
-                st.markdown(
-                    f"- **{p}** • {log_date} • **{float(delta_hours):+.2f} hrs** • *{kind}*\n"
-                    f"\n  Reason: {reason}\n"
-                    f"\n  _{created_at}_"
+            unseen_ids = [n[0] for n in notes if n[7] == 0]
+            if unseen_ids:
+                if st.button("Mark all as seen"):
+                    mark_notifications_seen(unseen_ids)
+                    st.rerun()
+
+            for nid, created_at, p, log_date, delta_hours, reason, source, seen in notes:
+                badge = "🟡 NEW" if seen == 0 else "⚪ Seen"
+                st.write(
+                    f"{badge} • {created_at} • **{p}** • {log_date} • "
+                    f"**{delta_hours:+.2f} hrs** • `{source}` • {reason}"
                 )
 
-    with t[4]:
+
+# -------------------------
+# ADMIN: LOGS
+# -------------------------
+if is_admin and len(admin_tabs) >= 2:
+    with admin_tabs[1]:
         st.subheader("Logs (Admin only)")
-        rows = fetch_logs()
+
+        filt_person = st.selectbox("Filter by person", ["(All)"] + PEOPLE, index=0)
+        rows = fetch_recent_logs(limit=200, person=None if filt_person == "(All)" else filt_person)
+
         if not rows:
-            st.info("No logs yet.")
+            st.write("No logs yet.")
         else:
-            for created_at, log_date, p, hrs, notes, source in rows[:300]:
-                st.markdown(
-                    f"- **{p}** • {log_date} • **{float(hrs):+.4f} hrs** • *{source}*\n"
-                    f"\n  Notes: {notes}\n"
-                    f"\n  _{created_at}_"
-                )
+            st.caption("Most recent first:")
+            for created_at, log_date, p, hrs, src, notes in rows:
+                st.write(f"• {created_at} • {log_date} • **{p}** • {hrs:+.4f} • `{src}` • {notes}")
