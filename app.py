@@ -23,6 +23,8 @@ WEEK_START = 0  # Monday
 
 REFRESH_MS = 1500  # only while clocked in
 
+def clamp_nonneg(x: float) -> float:
+    return max(0.0, float(x or 0.0))
 
 # ----------------------------
 # DB helpers
@@ -30,7 +32,6 @@ REFRESH_MS = 1500  # only while clocked in
 def db():
     con = sqlite3.connect(DB_PATH, timeout=30, check_same_thread=False)
     cur = con.cursor()
-    # Improve reliability on Streamlit Cloud
     cur.execute("PRAGMA journal_mode=WAL;")
     cur.execute("PRAGMA synchronous=NORMAL;")
     return con
@@ -47,14 +48,9 @@ def now_utc_str():
     return datetime.utcnow().isoformat()
 
 def migrate_notifications_if_needed(cur):
-    """
-    If old notifications table exists but missing columns (like created_at),
-    rebuild it cleanly and copy the compatible data over.
-    """
     required = {"created_at", "person", "log_date", "delta_hours", "reason", "kind"}
 
     if not table_exists(cur, "notifications"):
-        # Fresh create
         cur.execute("""
             CREATE TABLE IF NOT EXISTS notifications (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -70,9 +66,8 @@ def migrate_notifications_if_needed(cur):
 
     existing = get_cols(cur, "notifications")
     if required.issubset(existing):
-        return  # already good
+        return
 
-    # Rebuild (schema drift fix)
     cur.execute("""
         CREATE TABLE IF NOT EXISTS notifications_new (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -85,9 +80,6 @@ def migrate_notifications_if_needed(cur):
         )
     """)
 
-    # Build a safe INSERT using only columns that exist in the old table
-    # Defaults for missing columns:
-    # created_at -> current time, delta_hours -> 0, reason -> '', kind -> 'legacy'
     created_at_expr = "created_at" if "created_at" in existing else "datetime('now')"
     person_expr     = "person"     if "person" in existing else "''"
     log_date_expr   = "log_date"   if "log_date" in existing else "date('now')"
@@ -105,9 +97,6 @@ def migrate_notifications_if_needed(cur):
     cur.execute("ALTER TABLE notifications_new RENAME TO notifications")
 
 def migrate_logs_if_needed(cur):
-    """
-    Same idea for logs (prevents future schema drift issues).
-    """
     required = {"created_at", "log_date", "person", "hours", "notes", "source"}
 
     if not table_exists(cur, "logs"):
@@ -160,7 +149,6 @@ def init_db():
     con = db()
     cur = con.cursor()
 
-    # timers always consistent
     cur.execute("""
         CREATE TABLE IF NOT EXISTS timers (
             person TEXT PRIMARY KEY,
@@ -171,11 +159,9 @@ def init_db():
         )
     """)
 
-    # migrate / create logs & notifications safely
     migrate_logs_if_needed(cur)
     migrate_notifications_if_needed(cur)
 
-    # ensure timers rows
     today_iso = date.today().isoformat()
     for p in PEOPLE:
         cur.execute("""
@@ -185,7 +171,6 @@ def init_db():
 
     con.commit()
     con.close()
-
 
 # ----------------------------
 # Time helpers
@@ -203,9 +188,8 @@ def fmt_hms(seconds: int) -> str:
     s = seconds % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-
 # ----------------------------
-# Data access (NO CRASH GUARANTEE)
+# Data access
 # ----------------------------
 def fetch_timer(person: str):
     con = db()
@@ -261,7 +245,7 @@ def week_totals(d: date):
     con.close()
     out = {p: 0.0 for p in PEOPLE}
     for p, v in rows:
-        out[p] = float(v or 0.0)
+        out[p] = clamp_nonneg(v)
     return out
 
 def month_totals(d: date):
@@ -282,11 +266,10 @@ def month_totals(d: date):
     con.close()
     out = {p: 0.0 for p in PEOPLE}
     for p, v in rows:
-        out[p] = float(v or 0.0)
+        out[p] = clamp_nonneg(v)
     return out
 
 def fetch_notifications(limit=200):
-    # NEVER crash the app if DB is weird
     try:
         con = db()
         cur = con.cursor()
@@ -318,7 +301,6 @@ def fetch_logs(limit=300):
     except sqlite3.Error:
         return []
 
-
 # ----------------------------
 # APP UI
 # ----------------------------
@@ -335,11 +317,12 @@ with st.sidebar:
     st.divider()
     st.write("Everyone can see everyone (leaderboard enabled).")
 
-tab_names = ["⏱️ Clock In", "🏆 Leaderboard", "✍️ Manual Time", "🔔 Notifications"]
+# Tabs: Notifications + Logs ONLY for Drew
+tab_names = ["⏱️ Clock In", "🏆 Leaderboard", "✍️ Manual Time"]
 if person == ADMIN:
+    tab_names.append("🔔 Notifications (Admin)")
     tab_names.append("🧾 Logs (Admin only)")
 tabs = st.tabs(tab_names)
-
 
 # ----------------------------
 # TAB 1: CLOCK IN
@@ -349,12 +332,10 @@ with tabs[0]:
 
     is_running, started_at, acc_sec, active_date = fetch_timer(person)
 
-    # Reset day if not running
     if active_date != today.isoformat() and int(is_running) == 0:
         update_timer(person, 0, None, 0, today.isoformat())
         is_running, started_at, acc_sec, active_date = fetch_timer(person)
 
-    # Auto-refresh only while running
     if int(is_running) == 1 and HAVE_AUTOREFRESH:
         st_autorefresh(interval=REFRESH_MS, key=f"tick_{person}")
 
@@ -386,12 +367,12 @@ with tabs[0]:
                 st.rerun()
 
     with c2:
-        wk = week_totals(today).get(person, 0.0)
+        wk = clamp_nonneg(week_totals(today).get(person, 0.0))
         st.metric("This week", f"{wk:.2f} hrs")
         st.progress(min(1.0, wk / WEEKLY_TARGET) if WEEKLY_TARGET else 0.0)
 
     with c3:
-        mo = month_totals(today).get(person, 0.0)
+        mo = clamp_nonneg(month_totals(today).get(person, 0.0))
         st.metric("This month", f"{mo:.2f} hrs")
         st.progress(min(1.0, mo / MONTHLY_TARGET) if MONTHLY_TARGET else 0.0)
 
@@ -411,14 +392,14 @@ with tabs[1]:
 
     st.caption(f"Week starting {week_start(today)} • Goal {WEEKLY_TARGET:.0f} hrs")
     for i, p in enumerate(ordered, start=1):
-        hrs = wk.get(p, 0.0)
+        hrs = clamp_nonneg(wk.get(p, 0.0))
         st.write(f"**#{i} {p}** — {hrs:.2f} hrs")
         st.progress(min(1.0, hrs / WEEKLY_TARGET) if WEEKLY_TARGET else 0.0)
 
     st.divider()
     st.caption(f"Month starting {month_start(today)} • Vesting {MONTHLY_TARGET:.0f} hrs")
     for p in PEOPLE:
-        hrs = mo.get(p, 0.0)
+        hrs = clamp_nonneg(mo.get(p, 0.0))
         status = "✅ VESTED" if hrs >= MONTHLY_TARGET else "⏳ In progress"
         st.write(f"**{p}** — {hrs:.2f} hrs • {status}")
         st.progress(min(1.0, hrs / MONTHLY_TARGET) if MONTHLY_TARGET else 0.0)
@@ -460,36 +441,31 @@ with tabs[2]:
                 st.rerun()
 
 # ----------------------------
-# TAB 4: NOTIFICATIONS
-# ----------------------------
-with tabs[3]:
-    st.subheader("Notifications (Manual entries & adjustments)")
-
-    rows = fetch_notifications()
-    if not rows:
-        st.info("No notifications yet.")
-    else:
-        for created_at, p, log_date, delta_hours, reason, kind in rows[:150]:
-            st.markdown(
-                f"- **{p}** • {log_date} • **{delta_hours:+.2f} hrs** • *{kind}*\n"
-                f"\n  Reason: {reason}\n"
-                f"\n  _{created_at}_"
-            )
-
-# ----------------------------
-# ADMIN LOGS TAB (ONLY DREW)
+# ADMIN TABS (ONLY DREW)
 # ----------------------------
 if person == ADMIN:
+    with tabs[3]:
+        st.subheader("Notifications (Manual entries & adjustments)")
+        rows = fetch_notifications()
+        if not rows:
+            st.info("No notifications yet.")
+        else:
+            for created_at, p, log_date, delta_hours, reason, kind in rows[:200]:
+                st.markdown(
+                    f"- **{p}** • {log_date} • **{float(delta_hours):+.2f} hrs** • *{kind}*\n"
+                    f"\n  Reason: {reason}\n"
+                    f"\n  _{created_at}_"
+                )
+
     with tabs[4]:
         st.subheader("Logs (Admin only)")
-
         rows = fetch_logs()
         if not rows:
             st.info("No logs yet.")
         else:
             for created_at, log_date, p, hrs, notes, source in rows[:300]:
                 st.markdown(
-                    f"- **{p}** • {log_date} • **{hrs:+.2f} hrs** • *{source}*\n"
+                    f"- **{p}** • {log_date} • **{float(hrs):+.2f} hrs** • *{source}*\n"
                     f"\n  Notes: {notes}\n"
                     f"\n  _{created_at}_"
                 )
